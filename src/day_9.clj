@@ -3,54 +3,49 @@
             [clojure.string :as str]
             [clojure.java.io :as io]
             [clojure.core.async :refer [go-loop <! <!! >!! >! chan alt!!]]
-            [clojure.core.async :as async]))
-
+            [clojure.core.async :as async]
+            [clojure.set :as set]))
 
 (def ->instruction
-  "Lookup map for converting a two digit opcode to an instruction"
-  {[0 1] :add
-   [0 2] :multiply
-   [0 3] :input
-   [0 4] :output
-   [0 5] :jump-if-true
-   [0 6] :jump-if-false
-   [0 7] :less-than
-   [0 8] :equals
-   [0 9] :modify-relative-base
-   [9 9] :quit})
+  "Lookup map for instructions"
+  {1  {:name        :add
+       :param-count 3
+       :input-count 2}
+   2  {:name        :multiply
+       :param-count 3
+       :input-count 2}
+   3  {:name        :input
+       :param-count 1
+       :input-count 0}
+   4  {:name        :output
+       :param-count 1
+       :input-count 1}
+   5  {:name             :jump-if-true
+       :param-count      2
+       :input-count      2
+       :modifies-pointer true}
+   6  {:name             :jump-if-false
+       :param-count      2
+       :input-count      2
+       :modifies-poitner true}
+   7  {:name        :less-than
+       :param-count 3
+       :input-count 2}
+   8  {:name        :equals
+       :input-count 2
+       :param-count 3}
+   9  {:name        :modify-relative-base
+       :input-count 1
+       :param-count 1}
+   99 {:name        :quit
+       :param-count 0
+       :input-count 0}})
 
 (def ->parameter-mode
   "Lookup map for an int to a parameter mode"
   {0 :position
    1 :immediate
    2 :relative})
-
-(def ->param-count
-  "Map converting operations into the count of parameters"
-  {:add                  3
-   :multiply             3
-   :input                1
-   :output               1
-   :jump-if-true         2
-   :jump-if-false        2
-   :less-than            3
-   :equals               3
-   :modify-relative-base 1
-   :quit                 0})
-
-(def ->input-count
-  "Map converting operations into the count of inputs (ie. not the write destination)"
-  {:add                  2
-   :multiply             2
-   :input                0
-   :output               1
-   :jump-if-true         2
-   :jump-if-false        2
-   :less-than            2
-   :equals               2
-   :modify-relative-base 1
-   :quit                 0})
-
 
 (defn- left-zero-pad
   "Zero pads the provided string to the provided `len`"
@@ -62,84 +57,83 @@
 (defn parse-opcode
   "Parses an opcode into a tuple with the instruction name and the parameter modes"
   [opcode]
-  (let [digits                    (map (comp read-string str) (left-zero-pad 5 (str opcode)))
+  (let [digits                    (left-zero-pad 5 (str opcode))
         [param-modes instruction] (split-at 3 digits)
-        instruction               (->instruction (vec instruction))
-        param-modes               (into [] (map ->parameter-mode) (reverse param-modes))]
+        instruction               (->> instruction
+                                       (drop-while #{\0}) ;; trim leading zeros
+                                       (map str)
+                                       (apply str)
+                                       (read-string)
+                                       (->instruction))
+        _                         (when-not instruction
+                                    (throw (ex-info "Error finding instruction" {:opcode opcode
+                                                                                 :digits digits})))
+        param-modes               (->> param-modes
+                                       (reverse)
+                                       (take (:param-count instruction))
+                                       (map (comp ->parameter-mode read-string str))
+                                       (into []))]
     [instruction param-modes]))
 
-(defn get-parameter
-  "Function which gets the value of a parameter for the given value and mode"
-  [inputs rel-base param-type val mode]
-  (case [param-type mode]
-    [:input :immediate] val
-    [:input :position]  (aget inputs val)
-    [:input :relative]  (aget inputs (+ val rel-base))
-    [:output :position] val
-    [:output :relative] (+ val rel-base)))
+(defn ->value
+  "Function which loads the parameter value from the `computer`."
+  [{:keys [memory relative-base]} mode val]
+  (case mode
+    :immediate val
+    :position  (get memory val 0)
+    :relative  (get memory (+ val relative-base) 0)))
 
-(defn array-slice
-  "Returns an array slice"
-  [data start end]
-  (into [] (map (partial aget data)) (range start end)))
+(defn ->address
+  "Returns the parameter address in the computer for the provided `mode` and value"
+  [{:keys [relative-base]} mode val]
+  (case mode
+    :position val
+    :relative (+ val relative-base)))
 
 (defn next-instruction
-  "Function which reads the next instruction and returns a tuple of the instruction input
-  and the rest of the input"
-  [data ptr rel-base]
-  (let [[op param-modes]                       (parse-opcode (aget data ptr))
-        end-ptr                                (+ 1 ptr (->param-count op))
-        params-raw                             (array-slice data (inc ptr) end-ptr)
-        [input-params output-params]           (split-at (->input-count op) params-raw)
-        [input-param-modes output-param-modes] (split-at (->input-count op) param-modes)
-        input-params                           (vec (map (partial get-parameter data rel-base :input) input-params input-param-modes))
-        output-params                          (vec (map (partial get-parameter data rel-base :output) output-params output-param-modes))]
-    [[op input-params output-params] end-ptr]))
+  "Reads the next instruction from the computer and returns a tuple of the instruction
+  and the next instruction pointer address."
+  [{:keys [pointer memory] :as computer}]
+  (let [[{:keys [name
+                 param-count
+                 input-count]} param-modes] (parse-opcode (get memory pointer))
+        [inputs outputs]                    (->> (range (inc pointer) (+ (inc pointer) param-count))
+                                                 (map #(get memory % 0))
+                                                 (split-at input-count))
+        inputs                              (->> inputs
+                                                 (map (partial ->value computer) (take input-count param-modes)))
+        outputs                             (->> outputs
+                                                 (map (partial ->address computer) (drop input-count param-modes)))
+        new-ptr                             (+ 1 param-count pointer)]
+    [name inputs outputs new-ptr]))
 
 (defn make-program
   "Creates a program interpriter"
   [data in-chan out-chan quit-chan]
-  (let [data (long-array 40960 data)]
-    (go-loop [ptr 0
-              rel-base 0]
-      (let [[instruction new-ptr] (next-instruction data ptr rel-base)
-            [new-ptr rel-base]
-            (match instruction
-              [:multiply inputs [out]]          (do (aset data out (apply * inputs))
-                                                    [new-ptr rel-base])
-              [:add inputs [out]]               (do (aset data out (apply + inputs))
-                                                    [new-ptr rel-base])
-              [:input _ [out]]                  (do (aset data out (<! in-chan))
-                                                    [new-ptr rel-base])
-              [:output [x] _]                   (do (>! out-chan x)
-                                                    [new-ptr rel-base])
-              [:jump-if-true [x dest-ptr] _]    (if-not (zero? x)
-                                                  [dest-ptr rel-base]
-                                                  [new-ptr rel-base])
-              [:jump-if-false [x dest-ptr] _]   (if (zero? x)
-                                                  [dest-ptr rel-base]
-                                                  [new-ptr rel-base])
-              [:less-than [a b] [out]]          (do (aset data out (if (< a b)
-                                                                     1
-                                                                     0))
-                                                    [new-ptr rel-base])
-              [:equals [a b] [out]]             (do (aset data out (if (= a b)
-                                                                     1
-                                                                     0))
-                                                    [new-ptr rel-base])
-              [:equals [a b] [out]]             (do (aset data out (if (= a b)
-                                                                     1
-                                                                     0))
-                                                    [new-ptr rel-base])
-              [:modify-relative-base [a] []]    [new-ptr (+ rel-base a)]
-              [:quit _ _]                       (do
-                                                  (when quit-chan
-                                                    (>! quit-chan true))
-                                                  (when out-chan
-                                                    (async/close! out-chan))
-                                                  nil))]
-        (when new-ptr
-          (recur new-ptr rel-base))))))
+  (go-loop [computer {:memory        (into {} (map-indexed vector) data)
+                      :pointer       0
+                      :relative-base 0}]
+    (when computer
+      (let [[instruction [a b] [o] new-ptr] (next-instruction computer)
+            computer                        (assoc computer :pointer new-ptr)]
+        (recur (case instruction
+                 :multiply             (assoc-in computer [:memory o] (* a b))
+                 :add                  (assoc-in computer [:memory o] (+ a b))
+                 :input                (assoc-in computer [:memory o] (<! in-chan))
+                 :output               (do (>!! out-chan a)
+                                           computer)
+                 :jump-if-true         (if-not (zero? a)
+                                         (assoc computer :pointer b)
+                                         computer)
+                 :jump-if-false        (if (zero? a)
+                                         (assoc computer :pointer b)
+                                         computer)
+                 :less-than            (assoc-in computer [:memory o] (if (< a b) 1 0))
+                 :equals               (assoc-in computer [:memory o] (if (= a b) 1 0))
+                 :modify-relative-base (update computer :relative-base + a)
+                 :quit                 (do (when quit-chan (>! quit-chan true))
+                                           (when out-chan (async/close! out-chan))
+                                           nil)))))))
 
 (def input
   (-> (io/resource "input_09")
@@ -147,12 +141,11 @@
       (str/split #",")
       (#(into [] (map read-string) %))))
 
-(defn chan->vec
+(defn chan->seq
+  "Converts a channel into a lazy sequence. Should be called outside of a go block"
   [c]
-  (loop [out []]
-    (if-some [v (<!! c)]
-      (recur (conj out v))
-      out)))
+  (when-some [v (<!! c)]
+    (lazy-seq (cons v (chan->seq c)))))
 
 (defn run-program
   [data initial-input]
@@ -161,7 +154,7 @@
         quit-chan (chan 1)]
     (make-program data in-chan out-chan quit-chan)
     (>!! in-chan initial-input)
-    (chan->vec out-chan)))
+    (chan->seq out-chan)))
 
 (defn solve-part-1
   []
