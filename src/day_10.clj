@@ -1,6 +1,7 @@
 (ns day-10
   (:require [clojure.string :as str]
-            [clojure.java.io :as io]))
+            [clojure.java.io :as io]
+            [utils]))
 
 (defn input->asteroids
   "Converts an input string into a set of coordinates where asteroids are"
@@ -31,16 +32,6 @@
                   (* y-dist y-dist)))))
 
 
-(defn divisible-by?
-  "Returns whether x is divisible by y"
-  [x y]
-  (= 0 (rem x y)))
-
-(defn abs
-  "Returns the absolute value of `x`"
-  [x]
-  (max x (- x)))
-
 (defn line-projection
   "Returns a tuple of the smallest discrete x and y that would project
   from `a` to `b`"
@@ -50,12 +41,12 @@
         d-x       (- b-x a-x)
         d-y       (- b-y a-y)
         min-delta (cond
-                   (zero? d-x) (abs d-y)
-                   (zero? d-y) (abs d-x)
-                   :else       (min (abs d-x) (abs d-y)))]
+                   (zero? d-x) (utils/abs d-y)
+                   (zero? d-y) (utils/abs d-x)
+                   :else       (min (utils/abs d-x) (utils/abs d-y)))]
     (reduce (fn [[d-x d-y] factor]
-              (if (and (divisible-by? d-x factor)
-                       (divisible-by? d-y factor))
+              (if (and (utils/divisible-by? d-x factor)
+                       (utils/divisible-by? d-y factor))
                 [(/ d-x factor) (/ d-y factor)]
                 [d-x d-y]))
             [d-x d-y]
