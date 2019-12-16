@@ -1,5 +1,5 @@
 (ns intcode-computer
-  (:require [clojure.core.async :refer [go-loop <! >!! >! alt!] :as async]
+  (:require [clojure.core.async :refer [go-loop <! >!! >! alt! chan] :as async]
             [clojure.java.io :as io]
             [clojure.string :as str]))
 
@@ -107,33 +107,39 @@
 
 (defn make-program
   "Creates a program interpriter"
-  [data in-chan out-chan quit-chan]
-  (go-loop [computer {:memory        (into {} (map-indexed vector) data)
-                      :pointer       0
-                      :relative-base 0}]
-    (when computer
-      (let [[instruction [a b] [o] new-ptr] (next-instruction computer)
-            computer                        (assoc computer :pointer new-ptr)]
-        (recur (case instruction
-                 :multiply             (assoc-in computer [:memory o] (* a b))
-                 :add                  (assoc-in computer [:memory o] (+ a b))
-                 :input                (alt!
-                                         in-chan ([i] (assoc-in computer [:memory o] i))
-                                         (async/timeout 1000) (throw (ex-info "Timed out waiting for input" {})))
-                 :output               (do (>!! out-chan a)
+  [data]
+  (let [in-chan   (chan 1)
+        out-chan  (chan 1)
+        quit-chan (chan 1)]
+    (go-loop [computer {:memory        (into {} (map-indexed vector) data)
+                        :pointer       0
+                        :relative-base 0}]
+      (when computer
+        (let [[instruction [a b] [o] new-ptr] (next-instruction computer)
+              computer                        (assoc computer :pointer new-ptr)]
+          (recur (case instruction
+                   :multiply             (assoc-in computer [:memory o] (* a b))
+                   :add                  (assoc-in computer [:memory o] (+ a b))
+                   :input                (alt!
+                                           in-chan ([i] (assoc-in computer [:memory o] i))
+                                           (async/timeout 10000) (throw (ex-info "Timed out waiting for input" {})))
+                   :output               (do (>!! out-chan a)
+                                             computer)
+                   :jump-if-true         (if-not (zero? a)
+                                           (assoc computer :pointer b)
                                            computer)
-                 :jump-if-true         (if-not (zero? a)
-                                         (assoc computer :pointer b)
-                                         computer)
-                 :jump-if-false        (if (zero? a)
-                                         (assoc computer :pointer b)
-                                         computer)
-                 :less-than            (assoc-in computer [:memory o] (if (< a b) 1 0))
-                 :equals               (assoc-in computer [:memory o] (if (= a b) 1 0))
-                 :modify-relative-base (update computer :relative-base + a)
-                 :quit                 (do (when quit-chan (>! quit-chan true))
-                                           (when out-chan (async/close! out-chan))
-                                           nil)))))))
+                   :jump-if-false        (if (zero? a)
+                                           (assoc computer :pointer b)
+                                           computer)
+                   :less-than            (assoc-in computer [:memory o] (if (< a b) 1 0))
+                   :equals               (assoc-in computer [:memory o] (if (= a b) 1 0))
+                   :modify-relative-base (update computer :relative-base + a)
+                   :quit                 (do  (>! quit-chan true)
+                                              (async/close! out-chan)
+                                              nil))))))
+    {:in   in-chan
+     :out  out-chan
+     :quit quit-chan}))
 
 (defn load-intcode-data
   "Loads the provided `resource-name` as iput data for an intocode program"
